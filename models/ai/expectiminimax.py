@@ -1,10 +1,9 @@
 import math
 import random
 import networkx as nx
-import heapq
 import hashlib
 
-# Global transposition table for caching expectiminimax results
+# Cache for expectiminimax
 _trans_table_em = {}
 
 def zobrist_hash(board_str):
@@ -18,11 +17,7 @@ def expectiminimax(board, depth, alpha, beta, maximizing,
                    piece=AI_PIECE, visualize=False,
                    graph=None, id_counter=None, node_id=None,
                    strategy="combined", prune_threshold=0):
-    """
-    Optimized ExpectiMinimax with alpha-beta pruning, transposition caching,
-    optional visualization, and heuristic pruning.
-    """
-    # ----- Visualization setup -----
+    # --- Visualization setup ---
     if visualize:
         if graph is None:
             graph = nx.DiGraph()
@@ -31,83 +26,100 @@ def expectiminimax(board, depth, alpha, beta, maximizing,
         if node_id is None:
             node_id = id_counter["next"]
             id_counter["next"] += 1
+        graph.add_node(node_id,
+                       label='MAX' if maximizing else 'MIN',
+                       node_type='decision')
 
-    # ----- Transposition table lookup -----
-    board_str = "".join(board)  # Convert the board state to a string representation
-    key = (zobrist_hash(board_str), depth, maximizing, piece, strategy)
+    # --- Transposition lookup ---
+    key = (zobrist_hash("".join(board)), depth, maximizing, piece, strategy)
     if not visualize and key in _trans_table_em:
         return (*_trans_table_em[key], graph)
 
-    # ----- Check terminal state -----
     valid_cols = get_valid_locations(board)
+    # Terminal node?
     if depth == 0 or not valid_cols:
         score = evaluate_board(board, piece, strategy)
         if visualize:
-            graph.add_node(node_id, label=str(score))
+            graph.nodes[node_id]['label'] = str(score)
         return None, score, graph
 
-    # Opponent's piece and move piece determination
-    opp_piece = PLAYER_PIECE if piece == AI_PIECE else AI_PIECE
-    move_piece = piece if maximizing else opp_piece
+    # Determine who plays
+    opp = PLAYER_PIECE if piece == AI_PIECE else AI_PIECE
+    move_piece = piece if maximizing else opp
 
-    # ----- Generate children nodes -----
-    children = []
-    for col in valid_cols:
-        row = get_next_open_row(board, col)
-        new_board = drop_piece(board, row, col, move_piece)
-        h = evaluate_board(new_board, piece, strategy)
-        children.append((col, new_board, h))
-
-    # Use heapq.nlargest to get the top children based on the heuristic value
-    children = heapq.nlargest(5, children, key=lambda x: x[2] if maximizing else -x[2])
-
-    # ----- Alpha-beta pruning -----
     best_val = -math.inf if maximizing else math.inf
     best_col = random.choice(valid_cols)
 
-    # Branching weights (main, left, right)
-    weights = [(0, 0.6), (-1, 0.2), (1, 0.2)]
+    # For each possible move
+    for col in valid_cols:
+        row = get_next_open_row(board, col)
+        main_b = drop_piece(board, row, col, move_piece)
 
-    # ----- Explore each child -----
-    for col, main_board, _ in children:
+        # -- decision‐node child for playing in 'col' --
+        if visualize:
+            dec = id_counter['next']
+            id_counter['next'] += 1
+            graph.add_node(dec, label=f"col={col}", node_type='decision')
+            graph.add_edge(node_id, dec)
+        else:
+            dec = None
+
+        # Build chance‐node offsets (col, col-1, col+1)
+        offsets = [0]
+        if col - 1 in valid_cols: offsets.append(-1)
+        if col + 1 in valid_cols: offsets.append(1)
+        neighbors = len(offsets) - 1
+        neigh_w = 0.2 if neighbors == 2 else 0.4 if neighbors == 1 else 0.0
+        weights = [(off, 0.6 if off == 0 else neigh_w) for off in offsets]
+
         total = 0.0
-        for offset, weight in weights:
-            sub_col = col + offset
+        for off, w in weights:
+            sub_col = col + off
             if sub_col not in valid_cols:
                 continue
-            row = get_next_open_row(main_board, sub_col)
-            if row is None:
+            r = get_next_open_row(main_b, sub_col)
+            if r is None:
                 continue
-            sub_board = drop_piece(main_board, row, sub_col, move_piece)
+            sb = drop_piece(main_b, r, sub_col, move_piece)
 
-            # Heuristic pruning: evaluate before recursing deeper.
+            # Heuristic‐based pruning
             if prune_threshold > 0:
-                approx_score = evaluate_board(sub_board, piece, strategy)
-                if maximizing and approx_score < alpha - prune_threshold:
+                approx = evaluate_board(sb, piece, strategy)
+                if maximizing and approx < alpha - prune_threshold:
                     continue
-                if not maximizing and approx_score > beta + prune_threshold:
+                if not maximizing and approx > beta + prune_threshold:
                     continue
 
-            # Recursively call expectiminimax for the next move
-            child_id = None
             if visualize:
-                child_id = id_counter["next"]
-                id_counter["next"] += 1
+                # -- chance‐node --
+                ch = id_counter['next']
+                id_counter['next'] += 1
+                graph.add_node(ch, label=f"P={w:.2f}", node_type='chance')
+                graph.add_edge(dec, ch)
 
+                # Reserve an ID for the child of this chance node
+                nxt = id_counter['next']
+                id_counter['next'] += 1
+
+                # **Add the missing edge** from chance to its recursive child
+                graph.add_edge(ch, nxt)
+            else:
+                ch = None
+                nxt = None
+
+            # Recurse under the chance node
             _, score, graph = expectiminimax(
-                sub_board, depth - 1,
-                alpha, beta, not maximizing,
-                piece, visualize, graph, id_counter, child_id,
+                sb, depth - 1, alpha, beta, not maximizing,
+                piece, visualize, graph, id_counter, nxt,
                 strategy, prune_threshold
             )
-            total += weight * score
+            total += w * score
 
-            # Visualization updates
             if visualize:
-                graph.add_node(node_id, label=f"{total:.1f}")
-                graph.add_edge(node_id, child_id)
+                # Update chance‐node label to show weight & resulting score
+                graph.nodes[ch]['label'] = f"{w:.2f}\n{score:.2f}"
 
-        # Update best value and column
+        # Alpha‐beta updates
         if maximizing:
             if total > best_val:
                 best_val, best_col = total, col
@@ -116,12 +128,9 @@ def expectiminimax(board, depth, alpha, beta, maximizing,
             if total < best_val:
                 best_val, best_col = total, col
             beta = min(beta, best_val)
-
-        # Alpha-beta cutoff
         if alpha >= beta:
             break
 
-    # Cache result in transposition table (without graph)
     if not visualize:
         _trans_table_em[key] = (best_col, best_val)
 
